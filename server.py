@@ -8,6 +8,8 @@ from starlette.requests import Request
 from starlette.routing import Route, Mount
 import uvicorn
 
+from gmaps_scraper import SCRAPE_TOOL, scrape_google_maps
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-flash-image-preview"
 GEMINI_URL = (
@@ -35,12 +37,15 @@ async def list_tools():
                 },
                 "required": ["prompt"],
             },
-        )
+        ),
+        SCRAPE_TOOL,
     ]
 
 
 @app_mcp.call_tool()
 async def call_tool(name: str, arguments: dict):
+    if name == "scrape_google_maps":
+        return await scrape_google_maps(arguments)
     if name != "generate_image":
         raise ValueError(f"Unknown tool: {name}")
     prompt = arguments["prompt"]

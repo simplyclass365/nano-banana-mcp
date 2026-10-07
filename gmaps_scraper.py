@@ -12,15 +12,29 @@ import io
 import json
 import os
 import re
+import secrets
 import time
 
 import httpx
 from mcp.types import Tool, TextContent
+from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.styles import Font
+
+from usage_limits import ContactQuota
 
 SCRAPER_BASE_URL = os.environ.get("SCRAPER_BASE_URL", "http://localhost:8080").rstrip("/")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 UA = "nano-banana-mcp/1.0 (+https://github.com/simplyclass365/nano-banana-mcp)"
 POLL_INTERVAL = 5
+
+# Usage counters and Excel exports live here; on Railway, attach a volume so they survive redeploys.
+DATA_DIR = os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or "data"
+EXPORT_DIR = os.path.join(DATA_DIR, "exports")
+EXPORT_TTL = 24 * 3600
+EXPORT_NAME_RE = re.compile(r"^([0-9a-f]{32})-([a-z0-9-]{1,60})\.xlsx$")
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+quota = ContactQuota(os.path.join(DATA_DIR, "usage.sqlite3"))
 
 # The fields you contact and qualify a lead with; the engine returns ~34 raw columns.
 LEAD_FIELDS = ["title", "phone", "emails", "website", "category", "address", "review_rating", "review_count"]
@@ -30,9 +44,10 @@ SCRAPE_TOOL = Tool(
     name="scrape_google_maps",
     description=(
         "Scrape Google Maps business listings into lead rows (name, phone, emails, website, category, "
-        "address, rating, review count) with a Google Maps Scraper Kit engine. Scrapes run as jobs that "
-        "take minutes: if the job is still running when wait_seconds runs out, the result returns its "
-        "job_id. Call again with that job_id (and the same output options) to keep waiting."
+        "address, rating, review count) with a Google Maps Scraper Kit engine, plus a download link to "
+        "an Excel (.xlsx) file of the results. Contacts returned are capped per hour and per day. "
+        "Scrapes run as jobs that take minutes: if the job is still running when wait_seconds runs out, "
+        "the result returns its job_id. Call again with that job_id (and the same output options) to keep waiting."
     ),
     inputSchema={
         "type": "object",
@@ -62,6 +77,7 @@ SCRAPE_TOOL = Tool(
             "fields": {"type": "array", "items": {"type": "string"}, "description": "Columns to return instead of the default lead fields."},
             "full": {"type": "boolean", "default": False, "description": "Return all raw columns."},
             "output_format": {"type": "string", "enum": ["csv", "json"], "default": "csv"},
+            "excel": {"type": "boolean", "default": True, "description": "Also save the results as an Excel file and return its download link (valid 24 hours)."},
             "job_id": {"type": "string", "description": "Resume a job started by an earlier call instead of creating one."},
             "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 900, "default": 50, "description": "How long this call waits for the job before returning its job_id."},
         },
@@ -103,10 +119,10 @@ async def _geocode(place):
 async def _wait_for_job(client, job_id, wait_seconds):
     deadline = time.monotonic() + wait_seconds
     while True:
-        status = (await _api(client, "GET", f"/api/v1/jobs/{job_id}")).json().get("Status")
+        job = (await _api(client, "GET", f"/api/v1/jobs/{job_id}")).json()
         remaining = deadline - time.monotonic()
-        if status in ("ok", "failed") or remaining <= 0:
-            return status
+        if job.get("Status") in ("ok", "failed") or remaining <= 0:
+            return job
         await asyncio.sleep(min(POLL_INTERVAL, remaining))
 
 
@@ -168,6 +184,59 @@ async def _enrich_socials(rows, results, workers=8):
         await asyncio.gather(*(work(client, raw, result) for raw, result in zip(rows, results)))
 
 
+def _public_base_url():
+    if os.environ.get("PUBLIC_BASE_URL"):
+        return os.environ["PUBLIC_BASE_URL"]
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        return "https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"]
+    return None
+
+
+def _cell_value(field, value):
+    if field in ("review_rating", "review_count"):
+        try:
+            return int(value) if field == "review_count" else float(value)
+        except ValueError:
+            pass
+    return ILLEGAL_CHARACTERS_RE.sub("", value)
+
+
+def _save_xlsx(results, fields, title):
+    """Write results to EXPORT_DIR under an unguessable name, dropping exports older than EXPORT_TTL."""
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    for old in os.scandir(EXPORT_DIR):
+        if old.is_file() and time.time() - old.stat().st_mtime > EXPORT_TTL:
+            os.remove(old.path)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Leads"
+    ws.append(fields)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row_idx, result in enumerate(results, start=2):
+        for col_idx, field in enumerate(fields, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=_cell_value(field, result.get(field, "")))
+            if cell.data_type == "f":  # scraped text starting with "=" must not become a formula
+                cell.data_type = "s"
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = min(50, max(10, *(len(str(c.value or "")) + 2 for c in col)))
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "google-maps-leads"
+    name = f"{secrets.token_hex(16)}-{slug}.xlsx"
+    wb.save(os.path.join(EXPORT_DIR, name))
+    return name
+
+
+def export_file(name):
+    """(path, download filename) for a live export, or None."""
+    m = EXPORT_NAME_RE.match(name)
+    path = os.path.join(EXPORT_DIR, name)
+    if not m or not os.path.isfile(path) or time.time() - os.path.getmtime(path) > EXPORT_TTL:
+        return None
+    return path, f"{m.group(2)}.xlsx"
+
+
 def _dedupe(rows):
     seen, out = set(), []
     for r in rows:
@@ -180,13 +249,16 @@ def _dedupe(rows):
     return out
 
 
-async def scrape_google_maps(arguments):
+async def scrape_google_maps(arguments, base_url=None):
     job_id = arguments.get("job_id")
     notes = []
     if not job_id:
         keywords = list(dict.fromkeys(k.strip() for k in arguments.get("keywords", []) if k.strip()))
         if not keywords:
             raise ValueError("Pass keywords to start a scrape, or job_id to resume one.")
+        left, reason = quota.remaining()
+        if left == 0:
+            raise RuntimeError(f"{reason} {quota.summary()}")
         lat, lon = arguments.get("lat"), arguments.get("lon")
         if lat is None or lon is None:
             lat, lon = await _geocode(arguments.get("city") or keywords[0])
@@ -218,7 +290,8 @@ async def scrape_google_maps(arguments):
                 job_id = (await _api(client, "POST", "/api/v1/jobs", body)).json().get("id")
                 if not job_id:
                     raise RuntimeError("Scraper did not return a job id.")
-            status = await _wait_for_job(client, job_id, arguments.get("wait_seconds", 50))
+            job = await _wait_for_job(client, job_id, arguments.get("wait_seconds", 50))
+            status = job.get("Status")
             if status == "failed":
                 raise RuntimeError(
                     f"Scrape job {job_id} failed. If this keeps happening the scraper's IP may be "
@@ -238,6 +311,15 @@ async def scrape_google_maps(arguments):
         ) from e
 
     rows = _dedupe(list(csv.DictReader(io.StringIO(csv_text))))
+    found_total = len(rows)
+    # Charge only rows not delivered before, so resuming or re-downloading a job is free.
+    already = quota.charged(job_id)
+    extra = max(0, min(found_total - already, quota.remaining()[0]))
+    if extra:
+        quota.charge(job_id, extra)
+    if already + extra < found_total:
+        rows = rows[:already + extra]
+        notes.append(f"Returning {len(rows)} of the {found_total} businesses found. {quota.remaining()[1]}")
     if arguments.get("full"):
         fields = list(rows[0].keys()) if rows else LEAD_FIELDS
     else:
@@ -250,7 +332,7 @@ async def scrape_google_maps(arguments):
         found = sum(1 for r in results if any(r[k] for k in SOCIAL_FIELDS))
         notes.append(f"Social profiles found for {found}/{len(results)} businesses.")
 
-    if not results:
+    if not found_total:
         notes.append(
             "No results. The keyword may be too narrow or the coordinates wrong (try a wider radius), "
             "or the scraper's IP may be rate-limited."
@@ -264,6 +346,15 @@ async def scrape_google_maps(arguments):
         writer.writeheader()
         writer.writerows(results)
         data = buf.getvalue()
+
+    base_url = _public_base_url() or base_url
+    if arguments.get("excel", True) and results:
+        if base_url:
+            name = _save_xlsx(results, fields, job.get("Name") or "google-maps-leads")
+            notes.append(f"Excel file (link valid 24 hours): {base_url.rstrip('/')}/downloads/{name}")
+        else:
+            notes.append("No Excel link: set PUBLIC_BASE_URL to this server's public URL.")
+    notes.append(quota.summary())
 
     summary = "\n".join([f"Scrape job {job_id}: {len(results)} businesses. Fields: {', '.join(fields)}.", *notes])
     return [TextContent(type="text", text=summary), TextContent(type="text", text=data)]
